@@ -1,0 +1,235 @@
+diff --git a/execution.py b/execution.py
+index f38261b..638f6fd 100644
+--- a/execution.py
++++ b/execution.py
+@@ -1012,16 +1012,98 @@ class ExecutionMonitor:
+         pos.state = PositionState.OPEN
+ 
+     @staticmethod
+-    def _extract_price(state, lots_executed, lot_size):
++    def _extract_price_from_post_order_response(state, lots_executed=None):
++        """Цена за 1 инструмент из PostOrderResponse (ответ на отправку заявки).
++
++        SDK-контракт (официальная документация T-Invest API, orders.proto,
++        проверено 23.11.2026 по tinkoff.github.io/investAPI/orders и
++        developer.tinkoff.ru): PostOrderResponse.executed_order_price —
++        MoneyValue, «Исполненная СРЕДНЯЯ ЦЕНА ОДНОГО ИНСТРУМЕНТА в заявке» —
++        это уже цена за штуку. Деление на lots_executed/lot_size ЗАПРЕЩЕНО:
++        оно занижает цену в lots*lot_size раз (фактический инцидент
++        23.11.2026 LSRG: 858.8 -> 37.3391 при 23 лотах).
++
++        lots_executed используется ТОЛЬКО как валидатор исполнения (>0),
++        не участвует в вычислении цены.
++
++        Единицы Money (units/nano) — значение в торговой валюте инструмента;
++        конвертация не требуется (весь учёт ведётся в валюте инструмента:
++        price_before_order, avg_exec_price, CSV — одна валюта)."""
+         try:
+             ep = getattr(state, "executed_order_price", None)
+-            if ep is None or lots_executed <= 0 or lot_size <= 0:
++            if ep is None:
++                return None
++            if lots_executed is not None and int(lots_executed) <= 0:
+                 return None
+-            total = float(ep.units) + float(ep.nano) / 1e9
+-            return total / (lots_executed * lot_size)
++            price = float(ep.units) + float(ep.nano) / 1e9
++            return price if price > 0 else None
++        except Exception:
++            return None
++
++    @staticmethod
++    def _extract_price_from_order_state(state, lots_executed, lot_size):
++        """Цена за 1 инструмент из OrderState (отчёт состояния заявки).
++
++        SDK-контракт: OrderState.executed_order_price — MoneyValue,
++        «Исполненная цена заявки. Произведение средней цены покупки на
++        количество лотов» — это СУММА исполнения. Цена за штуку =
++        сумма / (lots_executed * lot_size).
++
++        ВНИМАНИЕ: одноимённое поле PostOrderResponse имеет ДРУГУЮ
++        семантику (цена за штуку) — см.
++        _extract_price_from_post_order_response. Один общий извлекатель
++        для двух типов ответа невозможен.
++
++        Fallback: stages[] — фактические стадии исполнения заявки
++        (OrderStage.price — цена за 1 инструмент, OrderStage.quantity —
++        количество штук); используется ТОЛЬКО если executed_order_price
++        недоступен/нулевой.
++
++        average_position_price («Средняя цена позиции по сделке»)
++        НЕ используется: это средняя цена ПОЗИЦИИ, а не заявки — для SELL
++        она равна цене входа и дала бы фиктивную цену выхода."""
++        try:
++            ep = getattr(state, "executed_order_price", None)
++            if (ep is not None and lots_executed is not None
++                    and int(lots_executed) > 0 and lot_size
++                    and int(lot_size) > 0):
++                total = float(ep.units) + float(ep.nano) / 1e9
++                if total > 0:
++                    return total / (int(lots_executed) * int(lot_size))
++            # Fallback: фактические стадии исполнения (цена за штуку x штуки).
++            stages = getattr(state, "stages", None) or []
++            money_sum = 0.0
++            qty_sum = 0.0
++            for st in stages:
++                p = getattr(st, "price", None)
++                q = getattr(st, "quantity", None)
++                if p is None or q is None:
++                    continue
++                price_i = float(p.units) + float(p.nano) / 1e9
++                q_i = float(q)
++                if price_i <= 0 or q_i <= 0:
++                    continue
++                money_sum += price_i * q_i
++                qty_sum += q_i
++            if qty_sum > 0 and money_sum > 0:
++                return money_sum / qty_sum
++            return None
+         except Exception:
+             return None
+ 
++    @staticmethod
++    def _extract_price(state, lots_executed, lot_size):
++        """СЕМАНТИКА OrderState (сумма исполнения) — совместимость.
++
++        Все существующие вызовы передают сюда OrderState
++        (get_sandbox_order_state / финальные состояния). Для
++        PostOrderResponse (ответ на отправку) используйте
++        _extract_price_from_post_order_response — у него executed_order_price
++        является ценой за штуку, и деление здесь дало бы занижение в
++        lots*lot_size раз (дефект 23.11.2026)."""
++        return ExecutionMonitor._extract_price_from_order_state(
++            state, lots_executed, lot_size)
++
+     @staticmethod
+     def _extract_commission(state):
+         try:
+diff --git a/main.py b/main.py
+index 0d71579..4096764 100644
+--- a/main.py
++++ b/main.py
+@@ -1226,6 +1226,7 @@ async def _try_resolve_absent_position(client: TinkoffClient,
+                 price = None
+         # Уточняем статус/исполнение/цену у брокера, если запись неполная.
+         # ЭТАП 5Б (§5.3): опрос с ЯВНЫМ типом идентификатора записи реестра.
++        state = None
+         if executed <= 0 or status not in _TERMINAL_ORDER_STATUSES or price is None:
+             state = await _poll_ledger_order_state(client, rec)
+             if state is not None:
+@@ -1280,6 +1281,62 @@ async def _try_resolve_absent_position(client: TinkoffClient,
+                 f"новые входы заблокированы до терминального статуса заявки."
+             )
+             return "uncertain"
++        # Задача C: согласование per-order журнала позиции с терминальным
++        # отчётом (реестр/брокер) ДО финализации учёта. apply_close_execution
++        # применяет подтверждённую дельту РОВНО ОДИН РАЗ (per-order cursor):
++        # close_orders[oid] получает терминальный статус, подтверждённое
++        # исполнение, цену и комиссию; close_applied_lots /
++        # close_applications / execution_price / actual_commission /
++        # exit_price_confirmed синхронизируются — state.json остаётся
++        # согласованным (раньше позиция становилась CLOSED, а запись
++        # close_orders оставалась INTENT с applied_lots=0). Повторный
++        # отчёт той же заявки не применяет лоты второй раз (заморозка
++        # терминала в apply_close_execution).
++        rec_commission = rec.get("commission")
++        if rec_commission is None and state is not None:
++            rec_commission = ExecutionMonitor._extract_commission(state)
++        monitor = monitor_ref
++        if monitor is not None:
++            try:
++                apply_ok = monitor.apply_close_execution(
++                    pos, oid, executed, str(status or "UNKNOWN"), price,
++                    rec_commission, requested,
++                )
++            except (TypeError, ValueError) as exc:
++                logging.error(
++                    f"[reconcile] {ticker}: применение исполнения SELL {oid} "
++                    f"не удалось ({type(exc).__name__}: {exc}) — учёт НЕ закрывается"
++                )
++                apply_ok = False
++                pos.state = PositionState.UNCERTAIN
++            if not apply_ok:
++                po_rec = (getattr(pos, "close_orders", {}) or {}).get(oid) or {}
++                applied_now = int(po_rec.get("applied_lots") or 0)
++                if applied_now >= min(executed, int(pos.quantity or 0) or executed):
++                    # Замороженный повтор терминального отчёта: дельта этой
++                    # заявки уже применена ранее — финализация идемпотентна,
++                    # повторного списания нет.
++                    logging.info(
++                        f"[reconcile] {ticker}: SELL {oid} уже применена "
++                        f"(applied={applied_now}) — идемпотентная финализация"
++                    )
++                else:
++                    # Настоящее противоречие (регресс/переполнение cumulative,
++                    # конфликт requested_lots): учёт НЕ закрывается (fail-closed,
++                    # разрешение оператором/сверкой), фиктивное закрытие запрещено.
++                    pos.state = PositionState.UNCERTAIN
++                    client.uncertain_state = True
++                    logging.error(
++                        f"[reconcile] {ticker}: противоречивый отчёт SELL {oid} "
++                        f"(executed={executed}, applied={applied_now}, "
++                        f"quantity={pos.quantity}) — учёт НЕ закрыт (fail-closed)"
++                    )
++                    research_logger.log_event("LEDGER_CLOSE_CONTRADICTION", {
++                        "figi": pos.figi, "ticker": ticker, "order_id": oid,
++                        "executed_lots": executed, "applied_lots": applied_now,
++                        "quantity": pos.quantity,
++                    })
++                    return "uncertain"
+         sold = min(executed, int(pos.quantity) or executed)
+         full = requested > 0 and executed >= requested
+         reason_text = str(rec.get("reason") or "")
+@@ -1717,14 +1774,35 @@ async def close_position(client: TinkoffClient, pos, price: float):
+         return
+ 
+     if ledger_ref is not None:
++        # Задача B: из PostOrderResponse SELL извлекаются фактические
++        # исполненные лоты, цена исполнения и комиссия.
++        # executed_order_price у PostOrderResponse — «средняя цена ОДНОГО
++        # инструмента» (цена за штуку) — извлекается БЕЗ деления на лоты
++        # (см. _extract_price_from_post_order_response). При отсутствии
++        # достоверной цены в реестр пишется None (UNKNOWN) — цена до
++        # заявки / цена входа НЕ подставляются. Комиссия — только
++        # фактическая executed_commission из отчёта (не выдумывается).
++        sell_executed = int(getattr(result.state, "lots_executed", 0) or 0)
++        sell_price = ExecutionMonitor._extract_price_from_post_order_response(
++            result.state, sell_executed)
++        sell_commission = ExecutionMonitor._extract_commission(result.state)
+         ledger_ref.record_sent(
+             close_order_request_id, trade_id=pos.trade_id, figi=pos.figi, ticker=pos.ticker,
+             side="SELL", requested_lots=pos.quantity,
+-            executed_lots=int(getattr(result.state, "lots_executed", 0) or 0),
++            executed_lots=sell_executed,
++            avg_exec_price=sell_price,
+             status_hint=_status_name(getattr(result.state, "execution_report_status", None)),
+             source="post_response",
+             exchange_order_id=str(exchange_order_id) if exchange_order_id else None,
+         )
++        # Комиссия SELL сохраняется в per-order журнале позиции:
++        # apply_close_execution позднее перенесёт её в pos.actual_commission
++        # (учёт сделки / CSV). Перезапись значения из отчёта брокера
++        # возможна только на более свежее (не None) значение.
++        if sell_commission is not None and monitor is not None:
++            po_rec = (getattr(pos, "close_orders", {}) or {}).get(close_order_request_id)
++            if po_rec is not None and po_rec.get("commission") is None:
++                po_rec["commission"] = float(sell_commission)
+ 
+     # Биржевой ID сохраняется ТОЛЬКО если брокер его вернул; иначе поле
+     # остаётся пустым до получения настоящего биржевого ID (§6 миграции).
+@@ -4165,7 +4243,14 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
+             })
+             client.uncertain_state = True
+             post_le = sent_le if sent_le else int(getattr(result.state, "lots_executed", 0) or 0)
+-            post_price = ExecutionMonitor._extract_price(result.state, post_le, info['lot']) if post_le > 0 else None
++            # Задача A: result.state — PostOrderResponse. Его
++            # executed_order_price — «средняя цена ОДНОГО инструмента»
++            # (цена за штуку), а НЕ сумма заявки: деление на лоты давало
++            # занижение цены входа в lots*lot_size раз (LSRG 23.11.2026:
++            # 858.8 -> 37.3391 при 23 лотах). Извлечение — отдельной
++            # функцией с семантикой PostOrderResponse, БЕЗ деления.
++            post_price = (ExecutionMonitor._extract_price_from_post_order_response(
++                result.state, post_le) if post_le > 0 else None)
+             await register_executed_buy(
+                 client, monitor, rm, ledger,
+                 figi=figi, ticker=inst['ticker'], order_id=order_id, trade_id=trade_id,
