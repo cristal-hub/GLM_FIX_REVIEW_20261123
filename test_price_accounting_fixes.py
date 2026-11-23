@@ -1,4 +1,4 @@
-# tests/test_price_accounting_fixes.py
+# test_price_accounting_fixes.py
 # ЗАДАЧИ A/B/C — исправление учёта цен BUY/SELL (Tsclp_v2.1_volatile_Samsung,
 # фактический инцидент LSRG 23.11.2026: две покупки 23 лота по 858.8/859.8,
 # цена входа в журнале 37.3391/37.3826 — занижение ровно в 23 раза).
@@ -25,7 +25,7 @@
 # сетевых запросов и реальных заявок; стратегия, OrderLedger, P0-5,
 # per-order cursor, fail-closed не затронуты.
 #
-# Запуск из корня сборки: pytest tests/test_price_accounting_fixes.py -v
+# Запуск из КОРНЯ репозитория (файл лежит в корне, НЕ в tests/): python -m pytest test_price_accounting_fixes.py -v
 
 import asyncio
 import csv

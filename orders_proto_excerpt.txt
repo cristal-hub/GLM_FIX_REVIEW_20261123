@@ -1,0 +1,65 @@
+# Официальный контракт T-Invest API — orders.proto
+# Источник: https://raw.githubusercontent.com/RussianInvestments/invest-python/main/protos/tinkoff/invest/grpc/orders.proto
+# Загружено 24.11.2026 (curl), файл проверен построчно: orders.proto, 411 строк.
+# Это официальный репозиторий Python SDK T-Invest (T-Bank); тот же proto входит в t-tech-investments==1.51.0.
+
+## PostOrderResponse (строки 105-126)
+message PostOrderResponse {
+  string order_id = 1; //Биржевой идентификатор заявки.
+  OrderExecutionReportStatus execution_report_status = 2; //Текущий статус заявки.
+  int64 lots_requested = 3; //Запрошено лотов.
+  int64 lots_executed = 4; //Исполнено лотов.
+
+  MoneyValue initial_order_price = 5; //Начальная цена заявки. Произведение количества запрошенных лотов на цену.
+  MoneyValue executed_order_price = 6; //Исполненная средняя цена одного инструмента в заявке.
+  MoneyValue total_order_amount = 7; //Итоговая стоимость заявки, включающая все комиссии.
+  MoneyValue initial_commission = 8; //Начальная комиссия. Комиссия рассчитанная при выставлении заявки.
+  MoneyValue executed_commission = 9; //Фактическая комиссия по итогам исполнения заявки.
+  MoneyValue aci_value = 10; //Значение НКД (накопленного купонного дохода) на дату. Подробнее: [НКД при выставлении торговых поручений](./head-orders#coupon)
+
+  string figi = 11; // Figi-идентификатор инструмента.
+  OrderDirection direction = 12; //Направление сделки.
+  MoneyValue initial_security_price = 13;  //Начальная цена за 1 инструмент. Для получения стоимости лота требуется умножить на лотность инструмента.
+  OrderType order_type = 14; //Тип заявки.
+  string message = 15; //Дополнительные данные об исполнении заявки.
+  Quotation initial_order_price_pt = 16; //Начальная цена заявки в пунктах (для фьючерсов).
+  string instrument_uid = 17; //UID идентификатор инструмента.
+  string order_request_id = 20; //Идентификатор ключа идемпотентности, переданный клиентом, в формате UID. Максимальная длина 36 символов.
+  ResponseMetadata response_metadata = 254; //Метадата
+
+## OrderState (строки 185-212)
+  repeated OrderState orders = 1; //Массив активных заявок.
+}
+
+//Информация о торговом поручении.
+message OrderState {
+  string order_id = 1; //Биржевой идентификатор заявки.
+  OrderExecutionReportStatus execution_report_status = 2; //Текущий статус заявки.
+  int64 lots_requested = 3; //Запрошено лотов.
+  int64 lots_executed = 4; //Исполнено лотов.
+  MoneyValue initial_order_price = 5; //Начальная цена заявки. Произведение количества запрошенных лотов на цену.
+  MoneyValue executed_order_price = 6; //Исполненная цена заявки. Произведение средней цены покупки на количество лотов.
+  MoneyValue total_order_amount = 7; //Итоговая стоимость заявки, включающая все комиссии.
+  MoneyValue average_position_price = 8; //Средняя цена позиции по сделке.
+  MoneyValue initial_commission = 9; //Начальная комиссия. Комиссия, рассчитанная на момент подачи заявки.
+  MoneyValue executed_commission = 10; //Фактическая комиссия по итогам исполнения заявки.
+  string figi = 11; //Figi-идентификатор инструмента.
+  OrderDirection direction = 12; //Направление заявки.
+  MoneyValue initial_security_price = 13; //Начальная цена за 1 инструмент. Для получения стоимости лота требуется умножить на лотность инструмента.
+  repeated OrderStage stages = 14; //Стадии выполнения заявки.
+  MoneyValue service_commission = 15; //Сервисная комиссия.
+  string currency = 16; //Валюта заявки.
+  OrderType order_type = 17; //Тип заявки.
+  google.protobuf.Timestamp order_date = 18; //Дата и время выставления заявки в часовом поясе UTC.
+  string instrument_uid = 19; //UID идентификатор инструмента.
+  string order_request_id = 20; //Идентификатор ключа идемпотентности, переданный клиентом, в формате UID. Максимальная длина 36 символов.
+}
+
+//Сделки в рамках торгового поручения.
+
+## OrderStage (строки 213-217)
+message OrderStage {
+  MoneyValue price = 1; //Цена за 1 инструмент. Для получения стоимости лота требуется умножить на лотность инструмента.
+  int64 quantity = 2; //Количество лотов.
+  string trade_id = 3; //Идентификатор сделки.
+  google.protobuf.Timestamp execution_time = 5; //Время исполнения сделки

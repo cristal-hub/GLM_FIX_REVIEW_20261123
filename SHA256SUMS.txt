@@ -1,0 +1,14 @@
+# SHA256 — точные версии файлов
+# Коммит-источник: aecf1e6d0dfa4faa02a47abd05ba3f78495559cf (репозиторий GLM_FIX_REVIEW_20261123, ветка main, единственный коммит)
+# Прогоны выполнены на файлах этого коммита (main.py, execution.py — байт-в-байт без изменений).
+
+[aecf1e6d — исходные версии]
+6570d956067df51e8f1785643889ba335b6a53bd7b8009b9ad1810643799077c  main.py
+23dda2d9f230406f342acf7f6b0c889379b6a9a1647a974e609b32261b22a206  execution.py
+dcfd3e2de23afe8d534b4d0465fe0b266b04a988e40ad925e41425782218b9fd  test_price_accounting_fixes.py
+
+[после проверки — итоговые версии для загрузки в репозиторий]
+6570d956067df51e8f1785643889ba335b6a53bd7b8009b9ad1810643799077c  main.py
+23dda2d9f230406f342acf7f6b0c889379b6a9a1647a974e609b32261b22a206  execution.py
+c980229da8dd6b290980befc73796aa3bba7550bdfa1125e0a587e6e9655e965  test_price_accounting_fixes.py
+266f1de8c379d46c0c8d2338687194c12425cf99f8f629ee3a41e25c06f8e434  diag_order_state.py
