@@ -1,0 +1,195 @@
+diff --git a/diag_order_state.py b/diag_order_state.py
+index e32d655..12c3796 100644
+--- a/diag_order_state.py
++++ b/diag_order_state.py
+@@ -41,6 +41,15 @@
+ # "не найдено"). Если тип ID неизвестен — сначала EXCHANGE, затем
+ # REQUEST; оба запроса явные.
+ #
++# FAIL-CLOSED (исправление после аудита GLM_FIX_REVIEW_20261123):
++# get_sandbox_order_state БЕЗ явно переданного order_id_type не
++# вызывается НИКОГДА. Если SDK не экспортирует OrderIdType, нужный
++# член enum отсутствует или режим неоднозначен — диагностическая
++# операция немедленно завершается с понятной ошибкой (код 2);
++# запрос к API не выполняется, ничего не отправляется.
++# Предупреждение с продолжением запроса без order_id_type
++# ЗАПРЕЩЕНО (ранее был fail-open — устранено).
++#
+ # Если подходящей существующей заявки нет — скрипт завершается
+ # безопасно с понятным сообщением (код 0). НЕ создавать новую заявку
+ # ради диагностики.
+@@ -55,9 +64,10 @@ from decimal import Decimal
+ from typing import List, Optional, Tuple
+ 
+ # SDK импортируется по образцу tinkoff_client.py (путь OrderIdType
+-# различается между сборками SDK; отсутствие enum не должно ронять
+-# скрипт — в этом случае используется прежний запрос без order_id_type
+-# с предупреждающей печатью).
++# различается между сборками SDK). FAIL-CLOSED: отсутствие enum
++# НЕ приводит к запросу без order_id_type — диагностика немедленно
++# завершается с понятной ошибкой (см. OrderIdTypeUnavailable,
++# _query_state и main).
+ try:
+     from t_tech.invest import AsyncClient  # noqa: F401 — как в tinkoff_client
+ except Exception:
+@@ -102,6 +112,20 @@ STATUS_NAMES = {
+     6: "EXPIRED",
+ }
+ 
++# Допустимые режимы типа идентификатора заявки (ЭТАП 5Б).
++ORDER_ID_TYPE_KINDS = ("EXCHANGE", "REQUEST")
++
++
++class OrderIdTypeUnavailable(RuntimeError):
++    """SDK не экспортирует OrderIdType либо нужный член enum отсутствует
++    или не может быть однозначно определён.
++
++    FAIL-CLOSED (исправление после аудита GLM_FIX_REVIEW_20261123):
++    выполнение get_sandbox_order_state без явно переданного
++    order_id_type запрещено — API-вызов не выполняется, диагностическая
++    операция немедленно завершается. Сообщения содержат только
++    маскированные идентификаторы (без токенов и секретов)."""
++
+ 
+ def _safe_error(e: Exception) -> str:
+     """Только тип исключения, без str(e) — чтобы не вывести чувствительные детали."""
+@@ -485,22 +509,49 @@ async def _query_state(client, account_id: str, oid: str,
+ 
+     kind: 'EXCHANGE' | 'REQUEST' | None. При kind=None сначала пробуется
+     EXCHANGE, затем REQUEST (оба запроса явные); UNSPECIFIED не используется
+-    никогда. При недоступном enum в SDK — прежний запрос без order_id_type
+-    с предупреждением (диагностика, не production-учёт)."""
++    никогда.
++
++    FAIL-CLOSED (исправление после аудита GLM_FIX_REVIEW_20261123):
++    запрос без ЯВНО переданного order_id_type не выполняется НИКОГДА.
++    Если SDK не экспортирует OrderIdType, нужный член enum отсутствует
++    или режим не однозначен — поднимается OrderIdTypeUnavailable:
++    диагностическая операция немедленно завершается с понятной ошибкой,
++    API-вызов не выполняется. Предупреждение с продолжением запроса
++    без order_id_type запрещено."""
+     if kind is None:
+-        for try_kind in ("EXCHANGE", "REQUEST"):
++        for try_kind in ORDER_ID_TYPE_KINDS:
+             state = await _query_state(client, account_id, oid, try_kind)
+             if state is not None:
+                 return state
+         return None
++
++    # Fail-closed 1/3: недопустимый/неоднозначный режим — запрос не выполняется.
++    if kind not in ORDER_ID_TYPE_KINDS:
++        raise OrderIdTypeUnavailable(
++            f"недопустимый тип идентификатора {kind!r} "
++            f"(ожидается 'EXCHANGE' или 'REQUEST')"
++        )
++
++    # Fail-closed 2/3: enum/member недоступны — запрос не выполняется.
+     member, supported = _order_id_type_member(kind)
+-    kwargs = {"account_id": account_id, "order_id": oid}
+-    if kind is not None:
+-        if not supported:
+-            print(f"  warning: SDK не экспортирует OrderIdType — запрос без "
+-                  f"order_id_type (ненадёжно для UUID, только диагностика)")
++    if not supported or member is None:
++        if OrderIdType is None:
++            reason = "SDK не экспортирует enum OrderIdType"
+         else:
+-            kwargs["order_id_type"] = member
++            reason = (f"в SDK OrderIdType нет члена "
++                      f"ORDER_ID_TYPE_{str(kind).upper()}")
++        raise OrderIdTypeUnavailable(
++            f"{reason} — достоверный запрос состояния заявки "
++            f"({_mask_order_id(oid)}, {kind}) НЕВОЗМОЖЕН без явного "
++            f"order_id_type"
++        )
++
++    # Fail-closed 3/3: kwargs ВСЕГДА содержат явный order_id_type.
++    kwargs = {
++        "account_id": account_id,
++        "order_id": oid,
++        "order_id_type": member,
++    }
+     try:
+         return await client.sandbox.get_sandbox_order_state(**kwargs)
+     except Exception as e:
+@@ -525,6 +576,18 @@ async def main() -> None:
+               "(см. requirements.txt). Ничего не отправлялось.")
+         return
+ 
++    # FAIL-CLOSED (исправление GLM_FIX_REVIEW_20261123): каждый запрос
++    # состояния требует ЯВНОГО order_id_type. Если SDK не экспортирует
++    # enum — диагностика невозможна; завершаем ДО подключения к API.
++    if OrderIdType is None:
++        print("ДИАГНОСТИКА НЕВОЗМОЖНА (fail-closed): SDK не экспортирует "
++              "OrderIdType, а запрос get_sandbox_order_state без явно "
++              "переданного order_id_type запрещён.")
++        print("Подключение к API не выполнялось, ничего не отправлялось.")
++        print("Обновите SDK (t-tech-investments) до версии с enum "
++              "OrderIdType и повторите запуск. НОВАЯ заявка НЕ создаётся.")
++        sys.exit(2)
++
+     # --- Разбор аргументов командной строки
+     args = [a for a in sys.argv[1:] if a]
+     explicit_id = None
+@@ -607,27 +670,40 @@ async def main() -> None:
+ 
+         diagnosed = 0
+         executed_found = False
+-        for idx, (oid, kind) in enumerate(to_check, 1):
+-            print(f"\n--- [{idx}/{len(to_check)}] order_id: {oid} "
+-                  f"({kind or 'тип неизвестен'}) ---")
+-            state = await _query_state(client, account_id, oid, kind)
+-            if state is None:
+-                print("  state=None: заявка не найдена или ответ не получен "
+-                      "(ошибка напечатана выше по типу исключения).")
+-                continue
+-            diagnosed += 1
+-            lot_size = None
+-            figi = getattr(state, "figi", None)
+-            if figi:
+-                lot_size = await _get_lot_size(client, figi)
+-            if _print_order_state(state, lot_size):
+-                executed_found = True
+-                break  # заявка с исполнением найдена — перебор остановлен
+-            else:
+-                # Просматриваем ещё несколько кандидатов: у NEW/CANCELLED
+-                # без исполнения цены нет, для диагностики нужен FILL.
+-                if idx >= MAX_STATE_REQUESTS:
+-                    break
++        try:
++            for idx, (oid, kind) in enumerate(to_check, 1):
++                print(f"\n--- [{idx}/{len(to_check)}] order_id: {oid} "
++                      f"({kind or 'тип неизвестен'}) ---")
++                state = await _query_state(client, account_id, oid, kind)
++                if state is None:
++                    print("  state=None: заявка не найдена или ответ не "
++                          "получен (ошибка напечатана выше по типу "
++                          "исключения).")
++                    continue
++                diagnosed += 1
++                lot_size = None
++                figi = getattr(state, "figi", None)
++                if figi:
++                    lot_size = await _get_lot_size(client, figi)
++                if _print_order_state(state, lot_size):
++                    executed_found = True
++                    break  # заявка с исполнением найдена — перебор остановлен
++                else:
++                    # Просматриваем ещё несколько кандидатов: у NEW/CANCELLED
++                    # без исполнения цены нет, для диагностики нужен FILL.
++                    if idx >= MAX_STATE_REQUESTS:
++                        break
++        except OrderIdTypeUnavailable as e:
++            print()
++            print("=" * 70)
++            print("ДИАГНОСТИКА ПРЕРВАНА (fail-closed):")
++            print(f"  {e}")
++            print("Запрос состояния без ЯВНОГО order_id_type запрещён; "
++                  "запрос к API не выполнялся, ничего не отправлялось.")
++            print("Обновите SDK (t-tech-investments) до версии с enum "
++                  "OrderIdType и повторите запуск. НОВАЯ заявка НЕ создаётся.")
++            print("=" * 70)
++            sys.exit(2)
+ 
+         print()
+         print("=" * 70)
